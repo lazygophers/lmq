@@ -4,12 +4,16 @@ import (
 	"errors"
 	"github.com/lazygophers/log"
 	"github.com/lazygophers/utils/anyx"
+	"github.com/lazygophers/utils/candy"
+	"github.com/lazygophers/utils/osx"
 	"os"
 	"path/filepath"
 	"strings"
+	"time"
 )
 
 const readDataNum = 10
+const maxRunningNum = 3
 
 var ERRIDXNULL = errors.New("idx is null")
 
@@ -25,9 +29,15 @@ type doneRq struct {
 }
 
 type Config struct {
-	path       string
-	maxSize    int
-	enableDisk bool
+	path    string
+	maxSize int
+}
+
+func NewConfig(path string, maxSize int) *Config {
+	return &Config{
+		path:    path,
+		maxSize: maxSize,
+	}
 }
 
 /*
@@ -47,32 +57,45 @@ type Queue struct {
 	writerPart uint64 //writer文件游标
 	writeSize  int
 
-	readerBuffer []*Message
-	readerDone   map[MessageId]bool
-	readerChan   chan chan *Message
-	datReader    *os.File
-	idxReader    *os.File
-	doneReader   *os.File
-	doneChan     chan *doneRq
-	readerPart   uint64 //reader文件游标
-	readSize     int
+	readerBuffer      []*Message
+	runningBufferMap  map[uint64]int64
+	runningMessageMap map[MessageId]*Message
+	readerDone        map[MessageId]bool
+	readerChan        chan chan *Message
+	datReader         *os.File
+	idxReader         *os.File
+	doneReader        *os.File
+	doneChan          chan *doneRq
+	readerPart        uint64 //reader文件游标
+	readSize          int
 }
 
-func NewQueue(name string, config *Config) *Queue {
+func NewQueue(name string, config *Config) (*Queue, error) {
 	p := &Queue{
-		name:         name,
-		config:       config,
-		writerChan:   make(chan *writerReq),
-		readerChan:   make(chan chan *Message),
-		readerBuffer: make([]*Message, 0),
-		readerDone:   make(map[MessageId]bool),
-		readerPart:   1,
-		writerPart:   1,
+		name:              name,
+		config:            config,
+		writerChan:        make(chan *writerReq),
+		readerChan:        make(chan chan *Message),
+		readerBuffer:      make([]*Message, 0),
+		runningBufferMap:  make(map[uint64]int64),
+		runningMessageMap: make(map[MessageId]*Message),
+		readerDone:        make(map[MessageId]bool),
+		readerPart:        1,
+		writerPart:        1,
+	}
+
+	if !osx.IsDir(config.path) {
+		err := os.MkdirAll(config.path, os.ModePerm)
+		if err != nil {
+			log.Errorf("err:%s", err)
+			return nil, err
+		}
 	}
 	//读文件列表
 	partList, err := os.ReadDir(config.path)
 	if err != nil {
 		log.Errorf("error: %s", err)
+		return nil, err
 	}
 
 	for i, part := range partList {
@@ -96,18 +119,20 @@ func NewQueue(name string, config *Config) *Queue {
 	err = p.openWriter()
 	if err != nil {
 		log.Errorf("err:%s", err)
+		return nil, err
 	}
 
 	//加载读文件
 	err = p.openReader()
 	if err != nil {
 		log.Errorf("err:%s", err)
+		return nil, err
 	}
 
 	_ = p.preRead()
 	go p.loop()
 
-	return p
+	return p, nil
 }
 
 func (p *Queue) openReader() (err error) {
@@ -192,13 +217,22 @@ func (p *Queue) openWriter() (err error) {
 	return nil
 }
 
-func (p *Queue) Write(wr *writerReq) {
-	p.writerChan <- wr
-	log.Infof("write msg:%v", wr)
+func (p *Queue) Write(msg *Message) error {
+	errChan := make(chan error, 1)
+	p.writerChan <- &writerReq{
+		message: msg,
+		errChan: errChan,
+	}
+	err := <-errChan
+	log.Infof("write msg:%v", msg)
+	return err
 }
 
-func (p *Queue) Read(msgChan chan *Message) {
+func (p *Queue) Read() *Message {
+	msgChan := make(chan *Message, 1)
 	p.readerChan <- msgChan
+
+	return <-msgChan
 }
 
 func (p *Queue) loop() {
@@ -245,19 +279,38 @@ func (p *Queue) loop() {
 				ch <- err
 			}
 		case rq := <-p.readerChan:
-			//读文件切片启动
-			if len(p.readerBuffer) == 0 || len(p.readerBuffer[0].Data) == 0 {
-				_ = p.preRead()
-			}
-			log.Infof("msg:%v", p.readerBuffer[0])
-			rq <- p.readerBuffer[0]
-			//删切片头元素
-			for i := 0; i < len(p.readerBuffer)-1; i++ {
-				p.readerBuffer[i] = p.readerBuffer[i+1]
-			}
+			p.readToChan(rq)
 		}
 	}
 
+}
+
+func (p *Queue) readToChan(msgChan chan *Message) {
+	//读文件切片启动
+	if len(p.readerBuffer) == 0 || len(p.readerBuffer[0].Data) == 0 {
+		_ = p.preRead()
+	}
+	log.Infof("msg:%v", p.readerBuffer[0])
+	for i, v := range p.readerBuffer {
+		log.Infof("tag running num:%d", p.runningBufferMap[v.Tag])
+		if p.runningBufferMap[v.Tag] >= maxRunningNum {
+			log.Infof("> max running num")
+			continue
+		}
+
+		if v.AccessExecAt > 0 && v.AccessExecAt > time.Now().Unix() {
+			continue
+		}
+
+		_ = p.tryReadData(v)
+		msgChan <- v
+		p.runningBufferMap[v.Tag]++
+		p.readerBuffer = candy.RemoveIndex(p.readerBuffer, i)
+		log.Infof("readBuffer lenth:%v", len(p.readerBuffer))
+		return
+	}
+
+	msgChan <- nil
 }
 
 func (p *Queue) writeTo(msgs []*Message) error {
@@ -336,6 +389,22 @@ func (p *Queue) preRead() error {
 	return nil
 }
 
+func (p *Queue) tryReadData(msg *Message) error {
+	if msg.dataLen == 0 {
+		return nil
+	}
+	if len(msg.Data) > 0 {
+		return nil
+	}
+
+	_, err := p.datReader.ReadAt(msg.Data, msg.offset)
+	if err != nil {
+		log.Errorf("err:%s", err)
+		return err
+	}
+	return nil
+}
+
 func (p *Queue) readDat() error {
 	for i := 0; i < readDataNum; i++ {
 		msg := p.readerBuffer[i]
@@ -360,6 +429,7 @@ func (p *Queue) readIdx() error {
 	}
 
 	var i int64
+	flag := false
 	for i < fileInfo.Size() {
 		log.Debug("当前读指针的位置是：", p.readSize)
 		msg := new(Message)
@@ -372,12 +442,19 @@ func (p *Queue) readIdx() error {
 
 		if !p.readerDone[msg.Id] {
 			p.readerBuffer = append(p.readerBuffer, msg)
+			flag = true
 			log.Infof("idx读出的msg:%v", msg)
 		}
 
 		i += int64(n)
 
 		p.readSize = int(i)
+	}
+
+	if flag {
+		p.readerBuffer = candy.SortUsing(p.readerBuffer, func(a, b *Message) bool {
+			return a.Priority > b.Priority
+		})
 	}
 
 	return nil
@@ -415,6 +492,13 @@ func (p *Queue) writeDone(msgIds []MessageId) error {
 		}
 
 		p.readerDone[msgId] = true
+
+		tag := p.runningMessageMap[msgId].Tag
+		if p.runningBufferMap[tag] > 1 {
+			p.runningBufferMap[tag]--
+		} else {
+			delete(p.runningBufferMap, tag)
+		}
 	}
 	return nil
 }
