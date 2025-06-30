@@ -6,16 +6,20 @@ import (
 	"github.com/lazygophers/utils/anyx"
 	"github.com/lazygophers/utils/candy"
 	"github.com/lazygophers/utils/osx"
+	"io"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"time"
 )
 
-const readDataNum = 10
-const maxRunningNum = 3
+const (
+	readDataNum   = 10
+	maxRunningNum = 3
+)
 
-var ERRIDXNULL = errors.New("idx is null")
+var ErrIdxNull = errors.New("idx is null")
 
 type writerReq struct {
 	message *Message
@@ -30,10 +34,10 @@ type doneRq struct {
 
 type Config struct {
 	path    string
-	maxSize int
+	maxSize int64
 }
 
-func NewConfig(path string, maxSize int) *Config {
+func NewConfig(path string, maxSize int64) *Config {
 	return &Config{
 		path:    path,
 		maxSize: maxSize,
@@ -53,35 +57,38 @@ type Queue struct {
 	writerChan chan *writerReq
 	datWriter  *os.File
 	idxWriter  *os.File
-	doneWriter *os.File
 	writerPart uint64 //writer文件游标
-	writeSize  int
+	writeSize  int64
+
+	datReader  *os.File
+	idxReader  *os.File
+	doneReader *os.File
+	doneChan   chan *doneRq
+	readerPart uint64 //reader文件游标
+	readSize   int64
 
 	readerBuffer      []*Message
 	runningBufferMap  map[uint64]int64
 	runningMessageMap map[MessageId]*Message
 	readerDone        map[MessageId]bool
 	readerChan        chan chan *Message
-	datReader         *os.File
-	idxReader         *os.File
-	doneReader        *os.File
-	doneChan          chan *doneRq
-	readerPart        uint64 //reader文件游标
-	readSize          int
 }
 
 func NewQueue(name string, config *Config) (*Queue, error) {
 	p := &Queue{
-		name:              name,
-		config:            config,
-		writerChan:        make(chan *writerReq),
-		readerChan:        make(chan chan *Message),
+		name:   name,
+		config: config,
+
+		writerChan: make(chan *writerReq, 100),
+		readerChan: make(chan chan *Message, 100),
+
 		readerBuffer:      make([]*Message, 0),
 		runningBufferMap:  make(map[uint64]int64),
 		runningMessageMap: make(map[MessageId]*Message),
 		readerDone:        make(map[MessageId]bool),
-		readerPart:        1,
-		writerPart:        1,
+
+		readerPart: 1,
+		writerPart: 1,
 	}
 
 	if !osx.IsDir(config.path) {
@@ -91,10 +98,11 @@ func NewQueue(name string, config *Config) (*Queue, error) {
 			return nil, err
 		}
 	}
+
 	//读文件列表
 	partList, err := os.ReadDir(config.path)
 	if err != nil {
-		log.Errorf("error: %s", err)
+		log.Errorf("err:%s", err)
 		return nil, err
 	}
 
@@ -129,7 +137,12 @@ func NewQueue(name string, config *Config) (*Queue, error) {
 		return nil, err
 	}
 
-	_ = p.preRead()
+	err = p.preRead()
+	if err != nil {
+		log.Errorf("err:%v", err)
+		return nil, err
+	}
+
 	go p.loop()
 
 	return p, nil
@@ -160,7 +173,7 @@ func (p *Queue) openReader() (err error) {
 		_ = p.doneReader.Close()
 		log.Debug("file close")
 	}
-	p.doneReader, err = os.OpenFile(filepath.Join(p.config.path, anyx.ToString(p.readerPart)+".done"), os.O_RDWR, 0600)
+	p.doneReader, err = os.OpenFile(filepath.Join(p.config.path, anyx.ToString(p.readerPart)+".done"), os.O_RDWR|os.O_CREATE, 0600)
 	if err != nil {
 		log.Errorf("err:%s", err)
 		return err
@@ -195,24 +208,8 @@ func (p *Queue) openWriter() (err error) {
 		return err
 	}
 
-	if p.doneWriter != nil {
-		_ = p.doneWriter.Close()
-		log.Debug("file close")
-		p.doneWriter = nil
-	}
-	p.doneWriter, err = os.OpenFile(filepath.Join(p.config.path, anyx.ToString(p.writerPart)+".done"), os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0600)
-	if err != nil {
-		_ = p.datWriter.Close()
-		_ = p.idxWriter.Close()
-		log.Debug("file close")
-		p.datWriter = nil
-		p.idxWriter = nil
-		log.Errorf("err:%s", err)
-		return err
-	}
-
 	size, _ := p.datWriter.Seek(0, 2)
-	p.writeSize = int(size)
+	p.writeSize = size
 
 	return nil
 }
@@ -287,6 +284,7 @@ func (p *Queue) loop() {
 
 func (p *Queue) readToChan(msgChan chan *Message) {
 	//读文件切片启动
+	// todo: 判断条件应该为文件是否发生变更
 	if len(p.readerBuffer) == 0 || len(p.readerBuffer[0].Data) == 0 {
 		_ = p.preRead()
 	}
@@ -314,12 +312,23 @@ func (p *Queue) readToChan(msgChan chan *Message) {
 }
 
 func (p *Queue) writeTo(msgs []*Message) error {
-	size := 0
-	var bt []byte
+	writeSize := p.writeSize
+
+	var size int64
+
+	// NOTE: 注意，这里的 b 被 dat 文件以及 idx 文件复用了，但处理 dat 和 idx 是分开的
+	b := log.GetBuffer()
+	defer log.PutBuffer(b)
+
 	for _, msg := range msgs {
-		size += len(msg.Data)
-		bt = append(bt, msg.Data...)
+		msg.offset = int64(writeSize)
+		msg.dataLen = int64(len(msg.Data))
+
+		size += msg.dataLen
+
+		b.Write(msg.Data)
 	}
+
 	//预估大小是否切换切片
 	if p.needChangePart(size) {
 		err := p.changePart()
@@ -330,7 +339,7 @@ func (p *Queue) writeTo(msgs []*Message) error {
 	}
 
 	//写data
-	_, err := p.datWriter.Write(bt)
+	_, err := b.WriteTo(p.datWriter)
 	if err != nil {
 		log.Errorf("err:%s", err)
 		return err
@@ -338,15 +347,21 @@ func (p *Queue) writeTo(msgs []*Message) error {
 
 	//写index
 	for _, msg := range msgs {
-		msg.offset = int64(p.writeSize)
-		msg.dataLen = int64(len(msg.Data))
 		log.Infof("msg write to:%v", msg)
-		_, err = msg.WriteTo(p.idxWriter)
-		p.writeSize += len(msg.Data)
+		_, err = msg.WriteTo(b)
 		if err != nil {
+			log.Errorf("err:%v", err)
 			return err
 		}
 	}
+
+	_, err = b.WriteTo(p.idxWriter)
+	if err != nil {
+		log.Errorf("err:%s", err)
+		return err
+	}
+
+	p.writeSize = writeSize
 
 	if p.needChangePart(0) {
 		err := p.changePart()
@@ -368,11 +383,11 @@ func (p *Queue) preRead() error {
 	}
 
 	if fileInfo.Size() == 0 {
-		log.Errorf("err:%s", ERRIDXNULL)
-		return ERRIDXNULL
+		log.Errorf("err:%s", ErrIdxNull)
+		return ErrIdxNull
 	}
 
-	if fileInfo.Size() > int64(p.readSize) {
+	if fileInfo.Size() > p.readSize {
 		err := p.readIdx()
 		if err != nil {
 			return err
@@ -393,31 +408,31 @@ func (p *Queue) tryReadData(msg *Message) error {
 	if msg.dataLen == 0 {
 		return nil
 	}
+
 	if len(msg.Data) > 0 {
 		return nil
 	}
 
+	msg.Data = make([]byte, msg.dataLen)
 	_, err := p.datReader.ReadAt(msg.Data, msg.offset)
 	if err != nil {
+		msg.Data = nil
 		log.Errorf("err:%s", err)
 		return err
 	}
+
 	return nil
 }
 
-func (p *Queue) readDat() error {
-	for i := 0; i < readDataNum; i++ {
-		msg := p.readerBuffer[i]
-
-		if msg.dataLen != 0 {
-			msg.Data = make([]byte, msg.dataLen)
-			_, err := p.datReader.ReadAt(msg.Data, msg.offset)
-			log.Debug("msg.data:", msg.Data)
-			if err != nil {
-				return err
-			}
+func (p *Queue) readDat() (err error) {
+	for i := 0; i < readDataNum && i < len(p.readerBuffer); i++ {
+		err = p.tryReadData(p.readerBuffer[i])
+		if err != nil {
+			log.Errorf("err:%s", err)
+			return err
 		}
 	}
+
 	return nil
 }
 
@@ -428,9 +443,8 @@ func (p *Queue) readIdx() error {
 		return err
 	}
 
-	var i int64
 	flag := false
-	for i < fileInfo.Size() {
+	for p.readSize+idxLen <= fileInfo.Size() {
 		log.Debug("当前读指针的位置是：", p.readSize)
 		msg := new(Message)
 		//TODO: 读切换
@@ -446,51 +460,51 @@ func (p *Queue) readIdx() error {
 			log.Infof("idx读出的msg:%v", msg)
 		}
 
-		i += int64(n)
-
-		p.readSize = int(i)
+		p.readSize += int64(n)
 	}
 
 	if flag {
-		p.readerBuffer = candy.SortUsing(p.readerBuffer, func(a, b *Message) bool {
-			return a.Priority > b.Priority
+		sort.Slice(p.readerBuffer, func(i, j int) bool {
+			return p.readerBuffer[i].Priority > p.readerBuffer[j].Priority
 		})
 	}
 
 	return nil
 }
 
-func (p *Queue) readDone() error {
-	fileInfo, err := p.doneReader.Stat()
-	if err != nil {
-		log.Errorf("err:%s", err)
-		return err
-	}
-
-	var i int64
-	for i < fileInfo.Size() {
+func (p *Queue) readDone() (err error) {
+	for {
 		var doneMsgId MessageId
-		n, err := p.doneReader.Read(doneMsgId[:])
+		_, err = p.doneReader.Read(doneMsgId[:])
 		if err != nil {
+			if err == io.EOF {
+				break
+			}
+
 			log.Errorf("err:%s", err)
 			return err
 		}
 
 		p.readerDone[doneMsgId] = true
-
-		i += int64(n)
 	}
 
 	return nil
 }
 
 func (p *Queue) writeDone(msgIds []MessageId) error {
-	for _, msgId := range msgIds {
-		_, err := p.doneReader.Write(msgId[:])
-		if err != nil {
-			return err
-		}
 
+	b := make([]byte, len(msgIds)*idLen)
+	for idx, msgId := range msgIds {
+		copy(b[idx*idLen:], msgId[:])
+	}
+
+	_, err := p.doneReader.Write(b)
+	if err != nil {
+		log.Errorf("err:%s", err)
+		return err
+	}
+
+	for _, msgId := range msgIds {
 		p.readerDone[msgId] = true
 
 		tag := p.runningMessageMap[msgId].Tag
@@ -500,22 +514,23 @@ func (p *Queue) writeDone(msgIds []MessageId) error {
 			delete(p.runningBufferMap, tag)
 		}
 	}
+
 	return nil
 }
 
 func (p *Queue) changePart() error {
-	p.writerPart += 1
+	p.writerPart++
 	err := p.openWriter()
 	if err != nil {
 		p.writerPart--
 		log.Errorf("err:%s", err)
 		return err
 	}
-	return nil
 
+	return nil
 }
 
-func (p *Queue) needChangePart(len int) bool {
+func (p *Queue) needChangePart(len int64) bool {
 	if p.writeSize+len > p.config.maxSize {
 		return true
 	}

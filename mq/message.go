@@ -27,14 +27,14 @@ const (
 )
 
 type Message struct {
-	Id           MessageId `json:"id"`
-	CreatedAt    int64     `json:"created_at"`
-	Data         []byte    `json:"data"`
-	AccessExecAt int64     `json:"access_exec_at"`
-	Tag          uint64    `json:"tag"`
-	Priority     Priority  `json:"priority"`
+	Id           MessageId `json:"id,omitempty"`
+	CreatedAt    int64     `json:"created_at,omitempty"`
+	Data         []byte    `json:"data,omitempty"`
+	AccessExecAt int64     `json:"access_exec_at,omitempty"`
+	Tag          uint64    `json:"tag,omitempty"`
+	Priority     Priority  `json:"priority,omitempty"`
 
-	RetryCount uint8 `json:"retry_count"`
+	RetryCount uint8 `json:"retry_count,omitempty"`
 
 	offset  int64
 	dataLen int64
@@ -43,15 +43,10 @@ type Message struct {
 func GenMessageId() (m MessageId) {
 	copy(m[:], sandid.New().String())
 	return
-
 }
 
-// 存储.idx文件
-func (p *Message) WriteTo(w io.Writer) (int, error) {
-	b := binary.LittleEndian
-	bt := make([]byte, idxLen)
-	log.Infof("msg offset: %d, msg datalen: %d", p.offset, p.dataLen)
-	/*
+/*
+	Message 索引文件结构:
 		0-2: begin标识符
 		2-18: message id
 		18-26: created_at
@@ -61,7 +56,14 @@ func (p *Message) WriteTo(w io.Writer) (int, error) {
 		48-56: data的起始位置
 		56-64: message data大小
 		64-66: end标识符
-	*/
+*/
+
+// WriteTo 存储.idx文件
+func (p *Message) WriteTo(w io.Writer) (int, error) {
+	b := binary.LittleEndian
+	bt := make([]byte, idxLen)
+	log.Infof("msg offset: %d, msg datalen: %d", p.offset, p.dataLen)
+
 	b.PutUint16(bt[0:2], itemBegin)
 	copy(bt[2:18], p.Id[:])
 	b.PutUint64(bt[18:26], uint64(p.CreatedAt))
