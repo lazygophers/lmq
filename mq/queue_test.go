@@ -16,12 +16,15 @@ func TestWR(t *testing.T) {
 	name := "test"
 	queue, err := NewQueue(name, &Config{
 		path:    "E:\\GH\\lmq\\mq\\" + name,
-		maxSize: 1024,
+		maxSize: 100,
 	})
-	t.Error(err)
+	if err != nil {
+		t.Fatal(err)
+		return
+	}
 
-	var ms []*Message
-	for i := 0; i < 10; i++ {
+	ms := make([]*Message, 0)
+	for i := 0; i < 50; i++ {
 		ms = append(ms, &Message{
 			Id:        GenMessageId(),
 			CreatedAt: time.Now().Unix() + int64(i),
@@ -33,13 +36,15 @@ func TestWR(t *testing.T) {
 	}
 
 	for _, m := range ms {
-		queue.Write(m)
-
+		t.Log(m)
+		err := queue.Write(m)
+		if err != nil {
+			t.Fatal(err)
+		}
 	}
 
-	for i := 0; i < 10; i++ {
+	for i := 0; i < 50; i++ {
 		t.Log(i)
-
 		t.Logf("读出的第%d个msg:%v", i, queue.Read())
 	}
 
