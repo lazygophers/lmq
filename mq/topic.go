@@ -1,9 +1,13 @@
 package mq
 
 import (
+	"errors"
 	"github.com/lazygophers/log"
 	"strconv"
+	"sync"
 )
+
+var ErrChannelAlreadyExists = errors.New("channel already exists")
 
 type Topic struct {
 	name     string
@@ -11,18 +15,57 @@ type Topic struct {
 	chanlist []*Channel // TODO: NAME 的值要唯一
 }
 
-func NewTopic(name string, queue *Queue) *Topic {
-	return &Topic{
+func NewTopic(name string, config *Config) (*Topic, error) {
+	queue, err := NewQueue(name, config)
+	if err != nil {
+		log.Errorf("NewTopic err:%s", err.Error())
+		return nil, err
+	}
+
+	p := &Topic{
 		name:  name,
 		queue: queue,
 	}
+
+	go p.loop()
+
+	return p, nil
 }
 
-// TODO: get  or add
-func (p *Topic) AddChannel(queue *Queue) {
-	c := NewChannel(p.name+strconv.Itoa(len(p.chanlist)), queue)
+func (p *Topic) loop() {
+	for {
+		// 新文件切片启动pull
+		if p.queue.readerPart < p.queue.writerPart && p.queue.readSize == 0 {
+			err := p.pull()
+			if err != nil {
+				log.Errorf("pull err:%s", err)
+			}
+		}
+
+		// 新写入启动pull
+		if p.queue.readerPart == p.queue.writerPart && p.queue.readSize < p.queue.writeSize {
+			err := p.pull()
+			if err != nil {
+				log.Errorf("pull err:%s", err)
+			}
+		}
+	}
+}
+
+func (p *Topic) AddChannel(config *Config) error {
+	if p.chanlist[len(p.chanlist)] != nil {
+		log.Errorf("channel already exists")
+		return ErrChannelAlreadyExists
+	}
+
+	c, err := NewChannel(p.name+strconv.Itoa(len(p.chanlist)), config)
+	if err != nil {
+		log.Errorf("AddChannel err:%s", err.Error())
+		return err
+	}
 
 	p.chanlist = append(p.chanlist, c)
+	return nil
 }
 
 func (p *Topic) RemoveChannel(i int) error {
@@ -41,30 +84,54 @@ func (p *Topic) Push(msg *Message) error {
 		return err
 	}
 
-	err = p.pull()
-	if err != nil {
-		return err
-	}
 	return nil
 }
 
-// TODO: 数据的copy应该是自动化的，非用户主动触发
+func (p *Topic) Pull() error {
+
+	return nil
+}
+
 func (p *Topic) pull() error {
 	// todo: 尝试刷新一下reader的信息以及reader buffer
+	//if p.queue.readerPart == p.queue.writerPart {
+	err := p.queue.readIdx()
+	if err != nil {
+		return err
+	}
+	//}
 
-	readerBuffer := make([]*Message, len(p.queue.readerBuffer))
-	copy(readerBuffer, p.queue.readerBuffer[:len(readerBuffer)])
+	size := len(p.queue.readerBuffer)
+	readerBuffer := make([]*Message, size)
+	copy(readerBuffer, p.queue.readerBuffer[:size])
 
+	var w *sync.WaitGroup
 	for _, v := range p.chanlist {
-		err := p.queue.transferMsg(v.queue, p.queue, readerBuffer)
+		w.Add(1)
+		go func() {
+			defer w.Done()
+			// 失败重试
+			for {
+				err := p.queue.transferMsg(v.queue, readerBuffer)
+				if err == nil {
+					break
+				}
+				log.Errorf("err:%s", err)
+			}
+		}()
+	}
+	w.Wait()
+
+	// 标记 readerBuffer 的数据都done了
+	for _, msg := range readerBuffer {
+		err := p.queue.writeDone(msg.Id)
 		if err != nil {
-			log.Errorf("err:%s", err)
 			return err
 		}
 	}
 
-	// 标记 readerBuffer 的数据都done了
-	// 移除  readerBuffer 的部分在 p.readerBuffer 内
+	//更新readerBuffer
+	p.queue.readerBuffer = p.queue.readerBuffer[size:]
 
 	return nil
 }

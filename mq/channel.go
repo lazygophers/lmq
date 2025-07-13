@@ -19,11 +19,16 @@ type Channel struct {
 	queue *Queue
 }
 
-func NewChannel(name string, queue *Queue) *Channel {
+func NewChannel(name string, config *Config) (*Channel, error) {
+	queue, err := NewQueue(name, config)
+	if err != nil {
+		log.Errorf("NewChannel err:%s", err.Error())
+		return nil, err
+	}
 	return &Channel{
 		name:  name,
 		queue: queue,
-	}
+	}, nil
 }
 
 // Consumer要数据

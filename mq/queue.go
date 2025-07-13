@@ -811,7 +811,7 @@ func (p *Queue) needChangeReadPart() bool {
 	return true
 }
 
-func (p *Queue) transferMsg(dst *Queue, src *Queue, readerBuffer []*Message) error {
+func (p *Queue) transferMsg(dst *Queue, readerBuffer []*Message) error {
 	firstMsg := candy.First(readerBuffer)
 	lastMsg := candy.Last(readerBuffer)
 	if firstMsg == nil || lastMsg == nil {
@@ -825,13 +825,13 @@ func (p *Queue) transferMsg(dst *Queue, src *Queue, readerBuffer []*Message) err
 	idxBeginOffset := firstMsg.Index * idxLen
 	idxEndOffset := lastMsg.Index*idxLen + idxLen
 
-	datCursor, _ := src.datReader.Seek(datBeginOffset, 0)
+	datCursor, _ := p.datReader.Seek(datBeginOffset, 0)
 	_, _ = dst.datWriter.Seek(datCursor, 0)
 
-	idxCursor, _ := src.idxWriter.Seek(idxBeginOffset, 0)
+	idxCursor, _ := p.idxWriter.Seek(idxBeginOffset, 0)
 	_, _ = dst.idxReader.Seek(idxCursor, 0)
 
-	_, err := io.CopyN(dst.datWriter, src.datReader, datEndOffset-datBeginOffset)
+	_, err := io.CopyN(dst.datWriter, p.datReader, datEndOffset-datBeginOffset)
 	if err != nil {
 		log.Errorf("err:%s", err)
 		_, _ = dst.datWriter.Seek(datCursor, 0)
@@ -839,27 +839,13 @@ func (p *Queue) transferMsg(dst *Queue, src *Queue, readerBuffer []*Message) err
 	}
 	// _, _ = dst.datWriter.Seek(datCursor+n, 0)
 
-	_, err = io.CopyN(dst.idxWriter, src.idxReader, idxEndOffset-datBeginOffset)
+	_, err = io.CopyN(dst.idxWriter, p.idxReader, idxEndOffset-datBeginOffset)
 	if err != nil {
 		log.Errorf("err:%s", err)
 		_, _ = dst.idxWriter.Seek(idxCursor, 0)
 		return err
 	}
 	// _, _ = dst.idxWriter.Seek(idxCursor+n, 0)
-
-	for _, msg := range readerBuffer {
-		err = p.writeDone(msg.Id)
-		if err != nil {
-			return err
-		}
-	}
-	//清空readerBuffer
-	p.readerBuffer = p.readerBuffer[:0]
-	//重新填充readerBuffer 不需要data
-	err = p.readIdx()
-	if err != nil {
-		return err
-	}
 
 	return nil
 }
