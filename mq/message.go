@@ -6,6 +6,7 @@ import (
 	"github.com/aofei/sandid"
 	"github.com/lazygophers/log"
 	"io"
+	"time"
 )
 
 const (
@@ -27,6 +28,8 @@ const (
 )
 
 type Message struct {
+	Index int64 `json:"index,omitempty"`
+
 	Id           MessageId `json:"id,omitempty"`
 	CreatedAt    int64     `json:"created_at,omitempty"`
 	Data         []byte    `json:"data,omitempty"`
@@ -34,7 +37,8 @@ type Message struct {
 	Tag          uint64    `json:"tag,omitempty"`
 	Priority     Priority  `json:"priority,omitempty"`
 
-	RetryCount uint8 `json:"retry_count,omitempty"`
+	RetryCount    uint8     `json:"retry_count,omitempty"`
+	RunningExecAt time.Time `json:"running_exec_at,omitempty"`
 
 	offset  int64
 	dataLen int64
@@ -48,31 +52,33 @@ func GenMessageId() (m MessageId) {
 /*
 	Message 索引文件结构:
 		0-2: begin标识符
-		2-18: message id
-		18-26: created_at
-		26-34: access_exec_at
-		34-46: tag
-		46-48: priority
-		48-56: data的起始位置
-		56-64: message data大小
-		64-66: end标识符
+		2-10: index
+		10-26: message id
+		26-34: created_at
+		34-42: access_exec_at
+		42-50: tag
+		50-52: priority
+		52-60: data的起始位置
+		60-68: message data大小
+		68-70: end标识符
 */
 
 // WriteTo 存储.idx文件
 func (p *Message) WriteTo(w io.Writer) (int, error) {
 	b := binary.LittleEndian
 	bt := make([]byte, idxLen)
-	log.Infof("msg offset: %d, msg datalen: %d", p.offset, p.dataLen)
+	log.Infof("write msg,offset:%d,datalen:%d,tag:%d", p.offset, p.dataLen, p.Tag)
 
 	b.PutUint16(bt[0:2], itemBegin)
-	copy(bt[2:18], p.Id[:])
-	b.PutUint64(bt[18:26], uint64(p.CreatedAt))
-	b.PutUint64(bt[26:34], uint64(p.AccessExecAt))
-	b.PutUint64(bt[34:46], p.Tag)
-	b.PutUint16(bt[46:48], uint16(p.Priority))
-	b.PutUint64(bt[48:56], uint64(p.offset))
-	b.PutUint64(bt[56:64], uint64(p.dataLen))
-	b.PutUint16(bt[64:66], itemEnd)
+	b.PutUint64(bt[2:10], uint64(p.Index))
+	copy(bt[10:26], p.Id[:])
+	b.PutUint64(bt[26:34], uint64(p.CreatedAt))
+	b.PutUint64(bt[34:42], uint64(p.AccessExecAt))
+	b.PutUint64(bt[42:50], p.Tag)
+	b.PutUint16(bt[50:52], uint16(p.Priority))
+	b.PutUint64(bt[52:60], uint64(p.offset))
+	b.PutUint64(bt[60:68], uint64(p.dataLen))
+	b.PutUint16(bt[68:70], itemEnd)
 
 	return w.Write(bt)
 }
@@ -90,14 +96,15 @@ func (p *Message) ReadFrom(r io.Reader) (n int, err error) {
 		return 0, ErrDataFail
 	}
 
-	copy(p.Id[:], bt[2:18])
-	p.CreatedAt = int64(b.Uint64(bt[18:26]))
-	p.AccessExecAt = int64(b.Uint64(bt[26:34]))
-	p.Tag = b.Uint64(bt[34:46])
-	p.Priority = Priority(binary.LittleEndian.Uint16(bt[46:48]))
-	p.offset = int64(b.Uint64(bt[48:56]))
-	p.dataLen = int64(b.Uint64(bt[56:64]))
-	if b.Uint16(bt[64:66]) != itemEnd {
+	p.Index = int64(b.Uint64(bt[2:10]))
+	copy(p.Id[:], bt[10:26])
+	p.CreatedAt = int64(b.Uint64(bt[26:34]))
+	p.AccessExecAt = int64(b.Uint64(bt[34:42]))
+	p.Tag = b.Uint64(bt[42:50])
+	p.Priority = Priority(binary.LittleEndian.Uint16(bt[50:52]))
+	p.offset = int64(b.Uint64(bt[52:60]))
+	p.dataLen = int64(b.Uint64(bt[60:68]))
+	if b.Uint16(bt[68:70]) != itemEnd {
 		return 0, ErrDataFail
 	}
 	return n, err
