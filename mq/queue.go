@@ -7,11 +7,11 @@ import (
 	"github.com/lazygophers/utils/candy"
 	"github.com/lazygophers/utils/osx"
 	"github.com/lazygophers/utils/runtime"
+	"github.com/lazygophers/utils/stringx"
 	"github.com/lazygophers/utils/unit"
 	"io"
 	"os"
 	"path/filepath"
-	"regexp"
 	"sort"
 	"strings"
 	"time"
@@ -23,6 +23,13 @@ const (
 )
 
 type retryType uint8
+
+type sorterType uint8
+
+const (
+	sorterTypeTopic sorterType = iota
+	sorterTypeChannel
+)
 
 const (
 	fixed retryType = iota
@@ -49,12 +56,18 @@ type doneRq struct {
 }
 
 type Config struct {
-	path      string
-	maxSize   int64
-	maxRetry  uint8
+	path     string
+	maxSize  int64
+	maxRetry uint8
+
 	baseDelay time.Duration
 	retryTime time.Duration
 	retryType retryType
+
+	sortType sorterType
+
+	accessTagList      []string
+	whiteAccessPattern bool
 }
 
 func (p *Config) apply() {
@@ -110,6 +123,7 @@ type Queue struct {
 	readerDone        map[MessageId]bool
 	readerChan        chan chan *Message
 	pullChan          chan *Message
+	topicPullChan     chan *Message
 
 	exitChan chan chan error
 
@@ -121,11 +135,12 @@ func NewQueue(name string, config *Config) (*Queue, error) {
 		name:   name,
 		config: config,
 
-		writerChan: make(chan *writerReq, 100),
-		readerChan: make(chan chan *Message, 100),
-		doneChan:   make(chan *doneRq, 100),
-		pullChan:   make(chan *Message),
-		exitChan:   make(chan chan error, 1),
+		writerChan:    make(chan *writerReq, 100),
+		readerChan:    make(chan chan *Message, 100),
+		doneChan:      make(chan *doneRq, 100),
+		pullChan:      make(chan *Message),
+		topicPullChan: make(chan *Message),
+		exitChan:      make(chan chan error, 1),
 
 		readerBuffer:      make([]*Message, 0),
 		runningBufferMap:  make(map[uint64]int64),
@@ -143,8 +158,7 @@ func NewQueue(name string, config *Config) (*Queue, error) {
 	}
 
 	//非topic
-	matched, _ := regexp.MatchString(`\d$`, p.name)
-	if matched {
+	if p.config.sortType == 1 {
 		p.sorter = func(i, j int) bool {
 			return p.readerBuffer[i].Priority > p.readerBuffer[j].Priority
 		}
@@ -396,6 +410,10 @@ Loop:
 		// 记录该文件切片的idx索引
 		ms[i].Index = int64(i - flag)
 		ms[i].offset = writeSize
+		for _, v := range ms[i].Tags {
+			ms[i].tagLen += int64(len(v))
+		}
+		ms[i].tagLen += int64(len(ms[i].Tags) - 1)
 		ms[i].dataLen = int64(len(ms[i].Data))
 
 		log.Debugf("Write No. %d msg: %v", i, ms[i])
@@ -417,7 +435,7 @@ Loop:
 			goto Loop
 		}
 
-		writeSize += ms[i].dataLen
+		writeSize += ms[i].tagLen + ms[i].dataLen
 		log.Debugf("After writesize:%d", writeSize)
 		log.Debugf("i: %d", i)
 	}
@@ -453,8 +471,8 @@ func (p *Queue) readToChan() (*Message, int, error) {
 	log.Debugf("readerBuffer lenth:%d", len(p.readerBuffer))
 
 	for i, v := range p.readerBuffer {
-		log.Infof("tag running num:%d", p.runningBufferMap[v.Tag])
-		if p.runningBufferMap[v.Tag] >= maxRunningNum {
+		log.Infof("tag running num:%d", p.runningBufferMap[v.Hash])
+		if p.runningBufferMap[v.Hash] >= maxRunningNum {
 			log.Infof("> max running num")
 			continue
 		}
@@ -474,7 +492,7 @@ func (p *Queue) readToChan() (*Message, int, error) {
 
 func (p *Queue) readAfter(m *Message, i int) {
 	m.RunningExecAt = time.Now()
-	p.runningBufferMap[m.Tag]++
+	p.runningBufferMap[m.Hash]++
 	p.runningMessageMap[m.Id] = m
 	p.readerBuffer = candy.RemoveIndex(p.readerBuffer, i)
 	log.Infof("readBuffer lenth:%v", len(p.readerBuffer))
@@ -525,10 +543,11 @@ func (p *Queue) writeTo(ms []*Message) error {
 	defer log.PutBuffer(b)
 
 	for _, m := range ms {
+		b.WriteString(strings.Join(m.Tags, "\u200b"))
 		b.Write(m.Data)
 	}
 
-	//写data
+	//写tag和data
 	_, err := b.WriteTo(p.datWriter)
 	if err != nil {
 		log.Errorf("err:%s", err)
@@ -543,7 +562,7 @@ func (p *Queue) writeTo(ms []*Message) error {
 			log.Errorf("err:%v", err)
 			return err
 		}
-		size += m.dataLen
+		size += m.tagLen + m.dataLen
 	}
 
 	_, err = b.WriteTo(p.idxWriter)
@@ -596,6 +615,28 @@ func (p *Queue) preRead() error {
 	return nil
 }
 
+func (p *Queue) tyrReadTag(msg *Message) error {
+	if msg.tagLen == 0 {
+		return nil
+	}
+
+	if len(msg.Tags) > 0 {
+		return nil
+	}
+
+	tagBuffer := make([]byte, msg.tagLen)
+	_, err := p.datReader.ReadAt(tagBuffer, msg.offset)
+	if err != nil {
+		msg.Tags = nil
+		log.Errorf("err:%s", err)
+		return err
+	}
+
+	msg.Tags = strings.Split(stringx.ToString(tagBuffer), "\u200b")
+
+	return nil
+}
+
 func (p *Queue) tryReadData(msg *Message) error {
 	if msg.dataLen == 0 {
 		return nil
@@ -606,7 +647,7 @@ func (p *Queue) tryReadData(msg *Message) error {
 	}
 
 	msg.Data = make([]byte, msg.dataLen)
-	_, err := p.datReader.ReadAt(msg.Data, msg.offset)
+	_, err := p.datReader.ReadAt(msg.Data, msg.offset+msg.tagLen)
 	if err != nil {
 		msg.Data = nil
 		log.Errorf("err:%s", err)
@@ -616,8 +657,14 @@ func (p *Queue) tryReadData(msg *Message) error {
 	return nil
 }
 
-func (p *Queue) readDat() (err error) {
+func (p *Queue) readDat() error {
 	for i := 0; i < readDataNum && i < len(p.readerBuffer); i++ {
+		err := p.tyrReadTag(p.readerBuffer[i])
+		if err != nil {
+			log.Errorf("err:%s", err)
+			return err
+		}
+
 		err = p.tryReadData(p.readerBuffer[i])
 		if err != nil {
 			log.Errorf("err:%s", err)
@@ -734,12 +781,12 @@ func (p *Queue) deleteRunningMsg(msgId MessageId) {
 	log.Debugf("deleteRunningMsg:%v", m)
 	delete(p.runningMessageMap, msgId)
 
-	tag := m.Tag
-	log.Debugf("deleteRunningMsg Tag Num:%v", p.runningBufferMap[tag])
-	if p.runningBufferMap[tag] > 1 {
-		p.runningBufferMap[tag]--
+	hash := m.Hash
+	log.Debugf("deleteRunningMsg Hash Num:%v", p.runningBufferMap[hash])
+	if p.runningBufferMap[hash] > 1 {
+		p.runningBufferMap[hash]--
 	} else {
-		delete(p.runningBufferMap, tag)
+		delete(p.runningBufferMap, hash)
 	}
 
 }

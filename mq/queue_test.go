@@ -40,7 +40,7 @@ func Test(t *testing.T) {
 				CreatedAt: time.Now().Unix() + int64(i),
 				Data:      []byte("hee"),
 				//AccessExecAt: time.Now().Unix() + randx.Int64(),
-				Tag:      uint64(i),
+				Hash:     uint64(i),
 				Priority: randx.Choose([]Priority{PriorityLow, PriorityMiddle, PriorityHigh}),
 			})
 			if err != nil {

@@ -1,11 +1,17 @@
 package mq
 
 import (
+	"errors"
 	"github.com/lazygophers/log"
 	"github.com/lazygophers/utils/json"
 	"github.com/lazygophers/utils/runtime"
 	"reflect"
 	"time"
+)
+
+var (
+	ErrTagAlreadyExist = errors.New("tag already exist")
+	ErrTagNoExist      = errors.New("tag no exist")
 )
 
 type ConsumeResp struct {
@@ -29,6 +35,31 @@ func NewChannel(name string, config *Config) (*Channel, error) {
 		name:  name,
 		queue: queue,
 	}, nil
+}
+
+func (p *Channel) IsAccess(tags []string) bool {
+	flag := false
+	for _, v := range tags {
+		_, t := p.getTag(v)
+		if t != "" {
+			flag = true
+		}
+		if !p.queue.config.whiteAccessPattern && t == "" {
+			return false
+		}
+	}
+
+	return flag
+}
+
+func (p *Channel) getTag(tag string) (int, string) {
+	for i, v := range p.queue.config.accessTagList {
+		if v == tag {
+			return i, v
+		}
+	}
+
+	return -1, ""
 }
 
 // Consumer要数据
@@ -142,6 +173,10 @@ func (p *Channel) Process(consumeCnt int, logic any) {
 					//time.Sleep(time.Microsecond * 200)
 					return
 				}*/
+
+				if !p.IsAccess(m.Tags) {
+					continue
+				}
 
 				resp, err := handle(m)
 				if err != nil {

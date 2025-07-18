@@ -3,16 +3,18 @@ package mq
 import (
 	"errors"
 	"github.com/lazygophers/log"
-	"strconv"
 	"sync"
+	"time"
 )
 
 var ErrChannelAlreadyExists = errors.New("channel already exists")
 
 type Topic struct {
-	name     string
-	queue    *Queue
-	chanlist []*Channel // TODO: NAME 的值要唯一
+	name  string
+	queue *Queue
+
+	channelMux sync.RWMutex
+	channelMap map[string]*Channel
 }
 
 func NewTopic(name string, config *Config) (*Topic, error) {
@@ -33,17 +35,17 @@ func NewTopic(name string, config *Config) (*Topic, error) {
 }
 
 func (p *Topic) loop() {
+	ticker := time.NewTicker(2 * time.Minute)
+	defer ticker.Stop()
+
 	for {
-		// 新文件切片启动pull
-		if p.queue.readerPart < p.queue.writerPart && p.queue.readSize == 0 {
+		select {
+		case <-ticker.C:
 			err := p.pull()
 			if err != nil {
 				log.Errorf("pull err:%s", err)
 			}
-		}
-
-		// 新写入启动pull
-		if p.queue.readerPart == p.queue.writerPart && p.queue.readSize < p.queue.writeSize {
+		case <-p.queue.topicPullChan:
 			err := p.pull()
 			if err != nil {
 				log.Errorf("pull err:%s", err)
@@ -52,29 +54,52 @@ func (p *Topic) loop() {
 	}
 }
 
-func (p *Topic) AddChannel(config *Config) error {
-	if p.chanlist[len(p.chanlist)] != nil {
-		log.Errorf("channel already exists")
-		return ErrChannelAlreadyExists
+func (p *Topic) GetOrAddChannel(name string, config *Config) (*Channel, error) {
+	p.channelMux.RLock()
+	channel := p.channelMap[name]
+	p.channelMux.RUnlock()
+
+	if channel != nil {
+		return channel, ErrChannelAlreadyExists
 	}
 
-	c, err := NewChannel(p.name+strconv.Itoa(len(p.chanlist)), config)
+	p.channelMux.Lock()
+	defer p.channelMux.Unlock()
+
+	channel = p.channelMap[name]
+	if channel != nil {
+		return channel, ErrChannelAlreadyExists
+	}
+
+	channel, err := NewChannel(name, config)
 	if err != nil {
-		log.Errorf("AddChannel err:%s", err.Error())
+		log.Errorf("NewChannel err:%s", err.Error())
+		return nil, err
+	}
+
+	p.channelMap[name] = channel
+	return channel, nil
+}
+
+func (p *Topic) RemoveChannel(name string) error {
+	err := p.channelMap[name].Close()
+	if err != nil {
 		return err
 	}
 
-	p.chanlist = append(p.chanlist, c)
+	delete(p.channelMap, name)
 	return nil
 }
 
-func (p *Topic) RemoveChannel(i int) error {
-	err := p.chanlist[i].Close()
-	if err != nil {
+func (p *Topic) UpdateChannel(name string, config *Config) error {
+	c, err := p.GetOrAddChannel(name, config)
+	if c == nil {
 		return err
 	}
 
-	p.chanlist = append(p.chanlist[:i], p.chanlist[i+1:]...)
+	p.channelMux.Lock()
+	c.queue.config = config
+	p.channelMux.Unlock()
 	return nil
 }
 
@@ -84,15 +109,27 @@ func (p *Topic) Push(msg *Message) error {
 		return err
 	}
 
-	return nil
-}
-
-func (p *Topic) Pull() error {
+	p.queue.topicPullChan <- msg
 
 	return nil
 }
+
+/*func (p *Topic) Pull() {
+	ticker := time.NewTicker(2 * time.Minute)
+	defer ticker.Stop()
+
+	for range ticker.C {
+		if p.queue.readerPart < p.queue.writerPart && p.queue.readSize == 0 || p.queue.readerPart == p.queue.writerPart && p.queue.readSize < p.queue.writeSize {
+			p.queue.topicPullChan <- true
+		}
+	}
+}*/
 
 func (p *Topic) pull() error {
+	// 退出条件
+	if p.queue.readerPart < p.queue.writerPart && p.queue.readSize != 0 || p.queue.readerPart == p.queue.writerPart && p.queue.readSize < p.queue.writeSize {
+		return nil
+	}
 	// todo: 尝试刷新一下reader的信息以及reader buffer
 	//if p.queue.readerPart == p.queue.writerPart {
 	err := p.queue.readIdx()
@@ -106,7 +143,7 @@ func (p *Topic) pull() error {
 	copy(readerBuffer, p.queue.readerBuffer[:size])
 
 	var w *sync.WaitGroup
-	for _, v := range p.chanlist {
+	for _, v := range p.channelMap {
 		w.Add(1)
 		go func() {
 			defer w.Done()
